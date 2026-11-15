@@ -1,3 +1,14 @@
+unreleased
+  - add audited dual-log (LOG1/LOG2) recovery: RegistryLog.recover_hive_with_logs()
+    decides the replay order from provable log sequences, refuses to silently splice
+    incompatible logs (sequence conflicts, sequence gaps, divergent dirty pages,
+    truncated chains), and returns a RecoveryReport linking the result to the
+    original hive, the log provenance, and the reasons anything was left unrecovered
+  - add RegistryLog.log_entries(), entry_fingerprints(), chain_status(),
+    last_valid_sequence(), and recover_hive_entries() helpers
+  - recover_hive()/recover_hive_continue() now return None instead of raising
+    NameError when a log contains no valid entries
+
 1.2.0
   - [DEPRECATED] records() in HBINBlock, use the more correct cells() instead, by @NiKiZe
   - fix bug in parsing of resident values with length zero, reported and patched by @BridgeyTheGeek
