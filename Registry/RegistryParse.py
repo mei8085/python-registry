@@ -222,6 +222,160 @@ class NotSupportedException(RegistryException):
     def __str__(self):
         return "Not Supported Exception (%s)" % (self._value)
 
+
+class SubkeyIndexErrorKind(Enum):
+    """
+    Classification of a damaged or unsafe subkey index entry.
+
+    CYCLIC_REFERENCE:    an ri index reaches itself (directly or indirectly)
+                         while it is still being expanded, so following it
+                         would never terminate.
+    DUPLICATE_REFERENCE: the same index cell, or the same NK cell, is
+                         referenced a second time. Following it would deliver
+                         the same evidence more than once.
+    INVALID_REFERENCE:   an entry points somewhere that cannot be parsed as
+                         the structure the index claims it is (for example,
+                         a free cell, a non-NK cell, or an offset past the
+                         end of the hive).
+    """
+    CYCLIC_REFERENCE = "cyclic reference"
+    DUPLICATE_REFERENCE = "duplicate reference"
+    INVALID_REFERENCE = "invalid reference"
+
+
+class SubkeyIndexError(RegistryException):
+    """
+    A single damaged or unsafe entry encountered while walking a subkey
+    index (ri/lf/lh/li).
+
+    Instances are recorded on a SubkeyTraversal instead of being raised,
+    so that enumeration of the unaffected sibling keys can continue and a
+    single bad index cannot abort parsing of the whole hive.
+
+    Attributes:
+      kind                SubkeyIndexErrorKind of the problem
+      list_record         the SubkeyList containing the bad entry (None when
+                          the index header itself cannot be parsed)
+      list_type           the index signature, e.g. b"ri", b"lf", b"lh", b"li"
+      list_offset         absolute buffer offset of the index record (-1 when
+                          no index record is available)
+      entry_index         zero-based index of the offending entry within the
+                          list (-1 when the whole index is affected)
+      referenced_offset   absolute buffer offset the offending entry points at
+      parent_key_path     best-effort path of the owning NKRecord
+      parent_key_offset   absolute buffer offset of the owning NKRecord
+                          (-1 when unknown)
+    """
+    def __init__(self, kind, list_record, entry_index, referenced_offset,
+                 value, parent_key=None):
+        """
+        Constructor.
+        Arguments:
+        - `kind`: a SubkeyIndexErrorKind
+        - `list_record`: the SubkeyList holding the bad entry, or None
+        - `entry_index`: zero-based entry index within the list, or -1
+        - `referenced_offset`: absolute offset the entry points at
+        - `value`: a human readable description
+        - `parent_key`: the owning NKRecord, if it can be determined
+        """
+        super(SubkeyIndexError, self).__init__(value)
+        self.kind = kind
+        self.list_record = list_record
+        if list_record is not None:
+            self.list_type = list_record.list_signature()
+            self.list_offset = list_record.offset()
+        else:
+            self.list_type = b""
+            self.list_offset = -1
+        self.entry_index = entry_index
+        self.referenced_offset = referenced_offset
+        if parent_key is not None:
+            self.parent_key_offset = parent_key.offset()
+            try:
+                self.parent_key_path = parent_key.path()
+            except RegistryException:
+                self.parent_key_path = "<unavailable>"
+        else:
+            self.parent_key_offset = -1
+            self.parent_key_path = "<unknown>"
+
+    def __str__(self):
+        return ("Subkey Index %s in %s list at 0x%x, entry %d -> 0x%x "
+                "(parent key 0x%x '%s'): %s" %
+                (self.kind.value, self.list_type, self.list_offset,
+                 self.entry_index, self.referenced_offset,
+                 self.parent_key_offset, self.parent_key_path, self._value))
+
+
+class SubkeyTraversal(object):
+    """
+    Shared state for a resilient traversal of subkey index records.
+
+    One instance is threaded through SubkeyList.keys() calls so that:
+      - cyclic index references (an ri list that reaches itself again while
+        it is still being expanded) are detected and skipped,
+      - duplicate index references (the same index cell expanded twice) are
+        detected and skipped,
+      - each NK cell is delivered at most once (hive-wide evidence de-dup),
+      - every problem is recorded as a SubkeyIndexError for later reporting.
+
+    De-duplication is always based on the source cell offset, never on the
+    key name. Two distinct NK cells with the same name are therefore both
+    delivered, preserving legitimate same-named sibling branches.
+    """
+    def __init__(self):
+        # index records currently being expanded further up the call stack
+        self._active_lists = set()
+        # index records that have already been expanded in this traversal
+        self._seen_lists = set()
+        # NK cell offsets that have already been yielded
+        self._seen_nk_cells = set()
+        # list of SubkeyIndexError recorded during the traversal
+        self.errors = []
+
+    def enter_list(self, list_offset):
+        """
+        Mark an index record as being expanded.
+
+        Returns:
+          "ok"        - the list has not been seen before and may be expanded,
+          "cycle"     - the list is already being expanded up the call stack,
+          "duplicate" - the list was already expanded earlier in this walk.
+        """
+        if list_offset in self._active_lists:
+            return "cycle"
+        if list_offset in self._seen_lists:
+            return "duplicate"
+        self._active_lists.add(list_offset)
+        self._seen_lists.add(list_offset)
+        return "ok"
+
+    def exit_list(self, list_offset):
+        """
+        Mark an index record as fully expanded (its expansion is unwinding).
+        """
+        self._active_lists.discard(list_offset)
+
+    def claim_nk(self, nk_cell_offset):
+        """
+        Reserve an NK cell for delivery.
+
+        Returns True the first time the cell is encountered in this
+        traversal and False on every later reference, so the same evidence
+        is never delivered twice even if several damaged indexes point at it.
+        """
+        if nk_cell_offset in self._seen_nk_cells:
+            return False
+        self._seen_nk_cells.add(nk_cell_offset)
+        return True
+
+    def record(self, error):
+        """
+        Record a SubkeyIndexError against this traversal.
+        """
+        self.errors.append(error)
+
+
 class RegistryBlock(object):
     """
     Base class for structure blocks in the Windows Registry.
@@ -307,6 +461,28 @@ class RegistryBlock(object):
         Equivalent to self.absolute_offset(0x0), which is the starting offset of this block.
         """
         return self._offset
+
+
+def first_hbin_offset(buf):
+    """
+    Get the absolute buffer offset of the first HBIN.
+
+    All offsets stored inside hive cells (NK/LF/LH/LI/RI/VK pointers) are
+    relative to the start of the first HBIN. This walks the buffer directly
+    instead of relying on the runtime parent chain, because damaged indexes
+    can leave a cell parented to an index record rather than an HBIN, in
+    which case climbing .parent() no longer reaches an HBINBlock.
+    """
+    # The REGF header always records the first HBIN offset at 0x24, and it
+    # is virtually always 0x1000. Fall back to the fixed value if the header
+    # field looks implausible.
+    try:
+        candidate = struct.unpack_from("<I", buf, 0x24)[0]
+        if struct.unpack_from("<I", buf, candidate)[0] == 0x6E696268:
+            return candidate
+    except struct.error:
+        pass
+    return 0x1000
 
 
 class REGFBlock(RegistryBlock):
@@ -622,12 +798,12 @@ class HBINCell(RegistryBlock):
         """
         Offsets contained in HBIN cells are relative to the beginning of the first HBIN.
         This converts the relative offset into an absolute offset.
-        """
-        h = self.parent()
-        while h.__class__.__name__ != "HBINBlock":
-            h = h.parent()
 
-        return h.first_hbin().offset() + offset
+        Resolved directly from the buffer rather than the parent chain so it
+        stays correct for cells reached through damaged subkey indexes, whose
+        parent is an index record rather than an HBINBlock.
+        """
+        return first_hbin_offset(self._buf) + offset
 
     def child(self):
         """
@@ -679,12 +855,11 @@ class Record(RegistryBlock):
         """
         Offsets contained in HBIN cells are relative to the beginning of the first HBIN.
         This converts the relative offset into an absolute offset.
-        """
-        h = self.parent()
-        while h.__class__.__name__ != "HBINBlock":
-            h = h.parent()
 
-        return h.first_hbin().offset() + offset
+        Resolved directly from the buffer rather than the parent chain so it
+        stays correct for records reached through damaged subkey indexes.
+        """
+        return first_hbin_offset(self._buf) + offset
 
 
 class DataRecord(Record):
@@ -1286,6 +1461,9 @@ class SubkeyList(Record):
     The required overload is self.keys(), which is a generator for all the subkeys (NKRecords).
     The SubkeyList is not meant to be used directly.
     """
+    # size of a single offset entry; overridden by concrete list types
+    _ENTRY_SIZE = 4
+
     def __init__(self, buf, offset, parent):
         """
         Constructor.
@@ -1299,15 +1477,55 @@ class SubkeyList(Record):
     def __str__(self):
         return "SubkeyList(Length: %d) at 0x%x" % (0, self.offset())
 
+    def list_signature(self):
+        """
+        The two byte signature of this index ('ri', 'lf', 'lh' or 'li').
+        """
+        return self.unpack_string(0x0, 2)
+
     def _keys_len(self):
         return self.unpack_word(0x2)
 
-    def keys(self):
+    def _owner_nk(self):
+        """
+        Walk the parent chain up to the NKRecord that owns this index.
+
+        Index records are always reached from an NKRecord's subkey list
+        pointer, possibly nested through RI records. Returns None if the
+        owning key cannot be located (which itself indicates damage).
+        """
+        block = self.parent()
+        seen = set()
+        while block is not None:
+            if isinstance(block, NKRecord):
+                return block
+            if block.offset() in seen:
+                return None
+            seen.add(block.offset())
+            block = block.parent()
+        return None
+
+    def _record_error(self, traversal, kind, entry_index, referenced_offset,
+                      message):
+        """
+        Build and record a locatable SubkeyIndexError, then return it.
+        """
+        error = SubkeyIndexError(kind, self, entry_index, referenced_offset,
+                                 message, self._owner_nk())
+        traversal.record(error)
+        return error
+
+    def keys(self, traversal=None):
         """
         A generator that yields the NKRecords referenced by this list.
         The base SubkeyList class returns no NKRecords, since it should not be used directly.
+
+        Arguments:
+        - `traversal`: optional SubkeyTraversal carrying the cycle/duplicate
+              state and error log for a resilient enumeration.
         """
         return
+        yield  # pragma: no cover - makes this a generator even though empty
 
 
 class RIRecord(SubkeyList):
@@ -1329,27 +1547,79 @@ class RIRecord(SubkeyList):
     def __str__(self):
         return "RIRecord(Length: %d) at 0x%x" % (len(self.keys()), self.offset())
 
-    def keys(self):
+    def keys(self, traversal=None):
         """
         A generator that yields the NKRecords referenced by this list.
         ri style entry size.
+
+        Each entry points at another subkey list (ri/li/lf/lh). The
+        traversal state guards against cyclic and duplicate index
+        references, and a single unreadable entry is recorded as a
+        SubkeyIndexError and skipped so that the remaining entries, and
+        the rest of the hive, can still be extracted.
+
+        Arguments:
+        - `traversal`: optional SubkeyTraversal shared with the rest of
+              the walk; a private one is created when not supplied.
         """
-        key_index = 0x4
+        if traversal is None:
+            traversal = SubkeyTraversal()
 
-        for _ in range(0, self._keys_len()):
-            key_offset = self.abs_offset_from_hbin_offset(self.unpack_dword(key_index))
-            d = HBINCell(self._buf, key_offset, self)
+        status = traversal.enter_list(self.offset())
+        if status != "ok":
+            kind = (SubkeyIndexErrorKind.CYCLIC_REFERENCE if status == "cycle"
+                    else SubkeyIndexErrorKind.DUPLICATE_REFERENCE)
+            self._record_error(
+                traversal, kind, -1, self.offset(),
+                "%s RI index at 0x%x; not re-expanding to avoid "
+                "re-delivering its subkeys" % (status, self.offset()))
+            return
 
-            try:
-                for k in d.child().keys():
-                    yield k
-            except RegistryStructureDoesNotExist:
-                raise ParseException("Unsupported subkey list encountered.")
+        try:
+            key_index = 0x4
+            for entry_index in range(0, self._keys_len()):
+                raw_offset = self.unpack_dword(key_index)
+                key_offset = self.abs_offset_from_hbin_offset(raw_offset)
+                try:
+                    d = HBINCell(self._buf, key_offset, self)
+                    child = d.child()
+                    if not isinstance(child, SubkeyList):
+                        raise ParseException(
+                            "RI entry points at unsupported subkey list type")
+                except (ParseException, RegistryStructureDoesNotExist,
+                        struct.error, IndexError) as e:
+                    self._record_error(
+                        traversal, SubkeyIndexErrorKind.INVALID_REFERENCE,
+                        entry_index, key_offset,
+                        "RI entry %d references an unreadable subkey list "
+                        "(relative offset 0x%x): %s" %
+                        (entry_index, raw_offset, e))
+                    key_index += 4
+                    continue
 
-            key_index += 4
+                # The child list registers itself with the traversal inside
+                # its own keys() call; do not pre-enter it here, otherwise it
+                # would appear to reach itself and be misreported as a cycle.
+                try:
+                    for k in child.keys(traversal):
+                        yield k
+                except (ParseException, RegistryStructureDoesNotExist,
+                        struct.error, IndexError) as e:
+                    self._record_error(
+                        traversal, SubkeyIndexErrorKind.INVALID_REFERENCE,
+                        entry_index, child.offset(),
+                        "RI entry %d subkey list at 0x%x could not be "
+                        "fully parsed: %s" % (entry_index, child.offset(), e))
+
+                key_index += 4
+        finally:
+            traversal.exit_list(self.offset())
 
 
 class DirectSubkeyList(SubkeyList):
+    # lf / lh entries are 8 bytes (offset + hash); li overrides to 4 bytes
+    _ENTRY_SIZE = 8
+
     def __init__(self, buf, offset, parent):
         """
         Constructor.
@@ -1363,19 +1633,73 @@ class DirectSubkeyList(SubkeyList):
     def __str__(self):
         return "DirectSubkeyList(Length: %d) at 0x%x" % (self._keys_len(), self.offset())
 
-    def keys(self):
+    def keys(self, traversal=None):
         """
         A generator that yields the NKRecords referenced by this list.
-        Assumes each entry is 0x8 bytes long (lf / lh style).
+        Each entry is an offset to an NK cell (lf / lh style entries are
+        8 bytes, li style entries are 4 bytes).
+
+        Damaged entries are isolated: an entry that does not resolve to a
+        valid NKRecord is recorded as a SubkeyIndexError and skipped, while
+        every unaffected sibling entry is still yielded. Entries that
+        point at an NK cell already delivered in this traversal are
+        duplicate references and are de-duplicated. De-duplication is by
+        source cell offset, so distinct keys that happen to share a name
+        are both returned.
+
+        Arguments:
+        - `traversal`: optional SubkeyTraversal shared with the rest of
+              the walk; a private one is created when not supplied.
         """
-        key_index = 0x4
+        if traversal is None:
+            traversal = SubkeyTraversal()
 
-        for _ in range(0, self._keys_len()):
-            key_offset = self.abs_offset_from_hbin_offset(self.unpack_dword(key_index))
+        status = traversal.enter_list(self.offset())
+        if status != "ok":
+            kind = (SubkeyIndexErrorKind.CYCLIC_REFERENCE if status == "cycle"
+                    else SubkeyIndexErrorKind.DUPLICATE_REFERENCE)
+            self._record_error(
+                traversal, kind, -1, self.offset(),
+                "%s %s index at 0x%x; not re-expanding to avoid "
+                "re-delivering its subkeys" %
+                (status, self.list_signature(), self.offset()))
+            return
 
-            d = HBINCell(self._buf, key_offset, self)
-            yield NKRecord(self._buf, d.data_offset(), self)
-            key_index += 8
+        try:
+            key_index = 0x4
+            for entry_index in range(0, self._keys_len()):
+                raw_offset = self.unpack_dword(key_index)
+                key_offset = self.abs_offset_from_hbin_offset(raw_offset)
+                try:
+                    d = HBINCell(self._buf, key_offset, self)
+                    nk = NKRecord(self._buf, d.data_offset(), self)
+                except (ParseException, RegistryStructureDoesNotExist,
+                        struct.error, IndexError) as e:
+                    self._record_error(
+                        traversal, SubkeyIndexErrorKind.INVALID_REFERENCE,
+                        entry_index, key_offset,
+                        "%s entry %d references an unreadable NK cell "
+                        "(relative offset 0x%x): %s" %
+                        (self.list_signature(), entry_index,
+                         raw_offset, e))
+                    key_index += self._ENTRY_SIZE
+                    continue
+
+                nk_cell_offset = d.offset()
+                if not traversal.claim_nk(nk_cell_offset):
+                    self._record_error(
+                        traversal, SubkeyIndexErrorKind.DUPLICATE_REFERENCE,
+                        entry_index, nk_cell_offset,
+                        "%s entry %d references NK cell already yielded "
+                        "in this traversal" %
+                        (self.list_signature(), entry_index))
+                    key_index += self._ENTRY_SIZE
+                    continue
+
+                yield nk
+                key_index += self._ENTRY_SIZE
+        finally:
+            traversal.exit_list(self.offset())
 
 
 class LIRecord(DirectSubkeyList):
@@ -1383,6 +1707,9 @@ class LIRecord(DirectSubkeyList):
     The LIRecord is a simple structure containing a list of offsets/pointers
     to subkey NKRecords. It is a single indirect block.
     """
+    # li entries are 4 bytes (offset only, no hash)
+    _ENTRY_SIZE = 4
+
     def __init__(self, buf, offset, parent):
         """
         Constructor.
@@ -1395,20 +1722,6 @@ class LIRecord(DirectSubkeyList):
 
     def __str__(self):
         return "LIRecord(Length: %d) at 0x%x" % (self._keys_len(), self.offset())
-
-    def keys(self):
-        """
-        A generator that yields the NKRecords referenced by this list.
-        li style entry size.
-        """
-        key_index = 0x4
-
-        for _ in range(0, self._keys_len()):
-            key_offset = self.abs_offset_from_hbin_offset(self.unpack_dword(key_index))
-
-            d = HBINCell(self._buf, key_offset, self)
-            yield NKRecord(self._buf, d.data_offset(), self)
-            key_index += 4
 
 
 class LFRecord(DirectSubkeyList):
@@ -1586,6 +1899,17 @@ class NKRecord(Record):
 
         d = HBINCell(self._buf, offset, self.parent())
         return NKRecord(self._buf, d.data_offset(), self.parent())
+
+    def cell_offset(self):
+        """
+        Get the absolute buffer offset of the HBINCell whose data is this
+        NKRecord (i.e. four bytes before the NK record itself).
+
+        This is the source unit of a key and is stable even when several
+        damaged indexes point at the same key, so it is used to de-duplicate
+        evidence and to report where a key was recovered from.
+        """
+        return self._offset - 0x4
 
     def sk_record(self):
         """

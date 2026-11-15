@@ -19,6 +19,7 @@
 from __future__ import print_function
 
 import sys
+import struct
 import ntpath
 from enum import Enum
 
@@ -97,6 +98,14 @@ class RegistryValueNotFoundException(RegistryParse.RegistryStructureDoesNotExist
 
     def __str__(self):
         return "Registry value not found: %s" % (self._value)
+
+
+# Re-exported so callers can classify damaged subkey indexes reported by
+# Registry.recovery_errors() / RegistryKey walks without reaching into
+# the low level parsing module.
+SubkeyIndexError = RegistryParse.SubkeyIndexError
+SubkeyIndexErrorKind = RegistryParse.SubkeyIndexErrorKind
+SubkeyTraversal = RegistryParse.SubkeyTraversal
 
 class RegistryValue(object):
     """
@@ -285,6 +294,18 @@ class RegistryKey(object):
         """
         return self._nkrecord.path()
 
+    def cell_offset(self):
+        """
+        Get the absolute offset (within the hive image) of the HBIN cell that
+        stores this key's NK record.
+
+        Together with path(), this identifies the source unit from which the
+        key was recovered. It is stable even when damaged indexes reference
+        the same key more than once, so it can be used to tell genuine
+        same-named sibling keys apart from duplicate index entries.
+        """
+        return self._nkrecord.cell_offset()
+
     def parent(self):
         """
         Get the parent RegistryKey of this key, or raise
@@ -299,30 +320,60 @@ class RegistryKey(object):
         except RegistryParse.ParseException:
             raise RegistryKeyHasNoParentException(self.name())
 
-    def subkeys(self):
+    def subkeys(self, traversal=None):
         """
         Return a list of all subkeys.
         Each element in the list is a RegistryKey.
         If the key has no subkeys, the empty list is returned.
+
+        Traversal of the ri/lf/lh/li indexes is resilient: cyclic index
+        references are broken, duplicate references are suppressed and
+        entries that do not resolve to a valid key are skipped, so a single
+        damaged index cannot prevent the unaffected sibling keys from being
+        returned. Any such problem is recorded as a SubkeyIndexError.
+
+        Arguments:
+        - `traversal`: optional SubkeyTraversal object. Pass the same
+              instance to several calls (as Registry.walk does) to share the
+              cycle/duplicate state and to collect every SubkeyIndexError in
+              one place. When omitted, a private traversal is created for
+              this call; its errors are discarded once the list is built.
         """
         if self._nkrecord.subkey_number() == 0:
             return []
 
-        l = self._nkrecord.subkey_list()
-        return [RegistryKey(k) for k in l.keys()]
+        try:
+            subkey_list = self._nkrecord.subkey_list()
+        except (RegistryParse.RegistryStructureDoesNotExist,
+                RegistryParse.ParseException, struct.error):
+            # The index header itself is unusable; there are no siblings we
+            # can recover through it. A shared traversal still gets a record.
+            if traversal is not None:
+                traversal.record(RegistryParse.SubkeyIndexError(
+                    RegistryParse.SubkeyIndexErrorKind.INVALID_REFERENCE,
+                    None, -1, -1,
+                    "subkey list of '%s' could not be parsed" % self.path(),
+                    self._nkrecord))
+            return []
 
-    def subkey(self, name):
+        return [RegistryKey(k) for k in subkey_list.keys(traversal)]
+
+    def subkey(self, name, traversal=None):
         """
         Return the subkey with a given name as a RegistryKey.
-        Raises RegistryKeyNotFoundException if the subkey with 
+        Raises RegistryKeyNotFoundException if the subkey with
           the given name does not exist.
+
+        The lookup goes through the same resilient index traversal as
+        subkeys(), so a damaged entry cannot hide an unaffected sibling that
+        happens to share the name.
         """
         if self._nkrecord.subkey_number() == 0:
             raise RegistryKeyNotFoundException(self.path() + "\\" + name)
 
-        for k in self._nkrecord.subkey_list().keys():
+        for k in self.subkeys(traversal):
             if k.name().lower() == name.lower():
-                return RegistryKey(k)
+                return k
         raise RegistryKeyNotFoundException(self.path() + "\\" + name)
 
     def values(self):
@@ -363,6 +414,50 @@ class RegistryKey(object):
         (immediate, _, future) = path.partition("\\")
         return self.subkey(immediate).find_key(future)
 
+    def walk(self, traversal=None):
+        """
+        Depth-first generator over this key and all of its descendants.
+
+        This is the forensic entry point for damaged hives. A single shared
+        SubkeyTraversal guarantees:
+          - cyclic ri/lf/lh/li references terminate instead of looping,
+          - an NK cell is yielded at most once even if several indexes point
+            at it, while distinct same-named sibling keys are all yielded,
+          - unreadable branches are skipped but never abort the walk, so the
+            unrelated parts of the hive are still extracted,
+          - every skipped/duplicated/cyclic entry is recorded as a
+            SubkeyIndexError retrievable via traversal.errors (or, when used
+            through Registry.walk, via Registry.recovery_errors()).
+
+        Each yielded RegistryKey retains its path() and cell_offset(), which
+        together identify the source unit the evidence came from.
+
+        Arguments:
+        - `traversal`: optional SubkeyTraversal to share with other walks;
+              a new one is created when omitted.
+        """
+        if traversal is None:
+            traversal = SubkeyTraversal()
+
+        # The starting key is claimed here. Every descendant is claimed while
+        # its parent's indexes are expanded in subkeys(), so cells are never
+        # re-claimed and the explicit stack below only needs to expand nodes.
+        if not traversal.claim_nk(self._nkrecord.cell_offset()):
+            return
+
+        stack = [self._nkrecord]
+        while stack:
+            nk = stack.pop()
+            key = RegistryKey(nk)
+            yield key
+
+            # reversed so that, for a healthy hive, children come out in
+            # roughly their stored order under depth-first traversal.
+            # subkeys() records cyclic/duplicate/invalid entries on the
+            # shared traversal and only returns each NK cell once.
+            for child in reversed(key.subkeys(traversal)):
+                stack.append(child._nkrecord)
+
     def values_number(self):
     	"""
     	Return the number of values associated with this key
@@ -394,6 +489,9 @@ class Registry(object):
             with open(filelikeobject, "rb") as f:
                 self._buf = f.read()
         self._regf = RegistryParse.REGFBlock(self._buf, 0, False)
+        # Shared state for the resilient forensic traversal. Each call to
+        # Registry.walk resets it, and recovery_errors reports its contents.
+        self._traversal = SubkeyTraversal()
 
     def __repr__(self):
         return 'Registry(hive_name="{0}", hive_type="{1}")'.format(self.hive_name(), self.hive_type())
@@ -450,6 +548,39 @@ class Registry(object):
         # are there any other keys at this
         # level? is this the name of the hive?
         return RegistryKey(self._regf.first_key()).find_key(path)
+
+    def walk(self):
+        """
+        Single-pass, resilient depth-first generator over every reachable
+        RegistryKey in the hive, starting at the root.
+
+        Cyclic ri/lf/lh/li references are broken instead of looping, each NK
+        cell is delivered at most once (so no piece of evidence is yielded
+        twice), and damaged branches are skipped with a SubkeyIndexError
+        recorded while the unrelated sibling keys continue to be extracted.
+        Genuine same-named sibling keys are always both delivered, because
+        de-duplication is based on the source cell offset rather than the
+        name.
+
+        Each call restarts with a fresh SubkeyTraversal, so repeated walks
+        each yield the full set of recoverable keys. The problems
+        encountered by the most recent walk are available through
+        recovery_errors().
+        """
+        self._traversal = SubkeyTraversal()
+        for key in RegistryKey(self._regf.first_key()).walk(self._traversal):
+            yield key
+
+    def recovery_errors(self):
+        """
+        Return the list of SubkeyIndexError entries recorded during the most
+        recent Registry.walk() call (empty before the first walk).
+
+        Each entry locates the problem precisely: the index type and offset,
+        the offending entry position, the offset it pointed at, and the path
+        and offset of the owning key.
+        """
+        return list(self._traversal.errors)
 
 def print_all(key):
     if len(key.subkeys()) == 0:
