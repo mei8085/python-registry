@@ -1,0 +1,21 @@
+== A. lone-surrogate sibling breaks lookup of OTHER keys ==
+  subkey('Emoji😀Key') -> 'Emoji😀Key'
+  subkey('DoesNotExist') -> UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal UTF-16 surrogate
+  enumerate names -> UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal UTF-16 surrogate
+
+== B. 'a\b' single key vs nested a\b: offset identity ==
+  single key 'a\b'  nk offset = 0x1144
+  nested key a->b    nk offset = 0x11f4
+  open('a\\b') resolves to offset 0x11f4 (NESTED key a->b)
+  both display path(): 'ROOT\\a\\b' vs 'ROOT\\a\\b'
+
+== C. value('(default)') vs value('(DEFAULT)') ==
+  value('(default)') -> has_name=False data='REAL-DEFAULT'
+  value('(DEFAULT)') -> has_name=True data='NAMED-(default)'
+  value('(Default)') -> has_name=True data='NAMED-(default)'
+  value('') -> has_name=False data='REAL-DEFAULT'
+
+== D. find_key with NUL-prefixed query on twin keys ==
+  subkey('Visible') -> offset 0x10ec
+  subkey('Visible\x00Hidden') -> offset 0x107c
+  subkey('Visible\x00AnythingElse') -> RegistryKeyNotFoundException

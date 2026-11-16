@@ -1,0 +1,202 @@
+
+========================================================================
+HIVE 1: compressed (ASCII) vs UTF-16 names, flag/content mismatch
+========================================================================
+hive checksum valid: True
+  nk.flags=0x0020 ascii_flag=True raw_name=b'PlainASCII'
+  name()      -> 'PlainASCII'
+  path()      -> 'ROOT\\PlainASCII'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0020 ascii_flag=True raw_name=b'\xdcn\xefcode'
+  name()      -> '\xdcn\xefcode'
+  path()      -> 'ROOT\\\xdcn\xefcode'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'C\x00J\x00K\x00.\x95'
+  name()      -> 'CJK\u952e'
+  path()      -> 'ROOT\\CJK\u952e'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0020 ascii_flag=True raw_name=b'F\x00l\x00a\x00g\x00L\x00i\x00e\x00'
+  name()      -> 'F\x00l\x00a\x00g\x00L\x00i\x00e\x00'
+  path()      -> 'ROOT\\F\x00l\x00a\x00g\x00L\x00i\x00e\x00'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'RawBytes'
+  name()      -> '\u6152\u4277\u7479\u7365'
+  path()      -> 'ROOT\\\u6152\u4277\u7479\u7365'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'O\x00d\x00d\x00L\x00e\x00n\x00A'
+  name()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode byte 0x41 in position 12: truncated data>"
+  path()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode byte 0x41 in position 12: truncated data>"
+  utf-8 encode-> OK
+  json dump   -> OK
+
+
+========================================================================
+HIVE 2: UTF-16 surrogates in names
+========================================================================
+  nk.flags=0x0000 ascii_flag=False raw_name=b'E\x00m\x00o\x00j\x00i\x00=\xd8\x00\xdeK\x00e\x00y\x00'
+  name()      -> 'Emoji\U0001f600Key'
+  path()      -> 'ROOT\\Emoji\U0001f600Key'
+  utf-8 encode-> OK
+  json dump   -> OK
+    vk.flags=0x0000 ascii=False raw_name=b'V\x00a\x00l\x00\x00\xd8'
+    value.name() -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 6-7: unexpected end of data>"
+    value.value()-> 'surrogate-value-name'
+    vk.flags=0x0001 ascii=True raw_name=b'Normal'
+    value.name() -> 'Normal'
+    value.value()-> 'normal'
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'L\x00o\x00n\x00e\x00H\x00i\x00g\x00h\x00\x00\xd8K\x00e\x00y\x00'
+  name()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal UTF-16 surrogate>"
+  path()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal UTF-16 surrogate>"
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'L\x00o\x00n\x00e\x00L\x00o\x00w\x00\x00\xdcK\x00e\x00y\x00'
+  name()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 14-15: illegal encoding>"
+  path()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 14-15: illegal encoding>"
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'R\x00e\x00v\x00e\x00r\x00s\x00e\x00d\x00\x00\xdc\x00\xd8'
+  name()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal encoding>"
+  path()      -> "<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal encoding>"
+  utf-8 encode-> OK
+  json dump   -> OK
+
+
+========================================================================
+HIVE 3: case-equivalent duplicates + case-fold divergence
+========================================================================
+enumeration order and Marker each key actually holds:
+  enumerated: name='Evidence' marker='first-in-list'
+  enumerated: name='EVIDENCE' marker='second-in-list'
+  enumerated: name='evidence' marker='third-in-list-utf16'
+  enumerated: name='\u017fpecial' marker=''
+  enumerated: name='Ksign' marker=''
+  enumerated: name='DupValues' marker=''
+
+lookup results (case-insensitive subkey()/find_key):
+  open('Evidence') -> path='ROOT\\Evidence' marker='first-in-list'
+  open('EVIDENCE') -> path='ROOT\\Evidence' marker='first-in-list'
+  open('evidence') -> path='ROOT\\Evidence' marker='first-in-list'
+  open('eViDeNcE') -> path='ROOT\\Evidence' marker='first-in-list'
+
+case-fold divergence vs Windows:
+  open('Special') -> <RegistryKeyNotFoundException: Registry key not found: ROOT\Special>
+  open('\u017fpecial') -> path='ROOT\\\u017fpecial' marker=''
+  open('Ksign') -> path='ROOT\\Ksign' marker=''
+  open('ksign') -> path='ROOT\\Ksign' marker=''
+  open('KSIGN') -> path='ROOT\\Ksign' marker=''
+
+duplicate values differing only by case:
+  enumerated value: name='Data' data='value-lower-first'
+  enumerated value: name='DATA' data='value-upper-second'
+  value('Data') -> 'value-lower-first'
+  value('DATA') -> 'value-lower-first'
+  value('data') -> 'value-lower-first'
+
+========================================================================
+HIVE 4: embedded NUL and path separator in names/data
+========================================================================
+  nk.flags=0x0000 ascii_flag=False raw_name=b'V\x00i\x00s\x00i\x00b\x00l\x00e\x00\x00\x00H\x00i\x00d\x00d\x00e\x00n\x00'
+  name()      -> 'Visible\x00Hidden'
+  path()      -> 'ROOT\\Visible\x00Hidden'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0020 ascii_flag=True raw_name=b'Visible'
+  name()      -> 'Visible'
+  path()      -> 'ROOT\\Visible'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0000 ascii_flag=False raw_name=b'a\x00\\\x00b\x00'
+  name()      -> 'a\\b'
+  path()      -> 'ROOT\\a\\b'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0020 ascii_flag=True raw_name=b'a'
+  name()      -> 'a'
+  path()      -> 'ROOT\\a'
+  utf-8 encode-> OK
+  json dump   -> OK
+
+  nk.flags=0x0020 ascii_flag=True raw_name=b'Values'
+  name()      -> 'Values'
+  path()      -> 'ROOT\\Values'
+  utf-8 encode-> OK
+  json dump   -> OK
+    vk.flags=0x0000 ascii=False raw_name=b'V\x00a\x00l\x00\x00\x00S\x00u\x00f\x00f\x00i\x00x\x00'
+    value.name() -> 'Val\x00Suffix'
+    value.value()-> 'nul-value-name'
+    vk.flags=0x0001 ascii=True raw_name=b'TruncData'
+    value.name() -> 'TruncData'
+    value.value()-> 'abc'
+    vk.flags=0x0001 ascii=True raw_name=b'CjkData'
+    value.name() -> 'CjkData'
+    value.value()-> 'abc\xc0\u4e00'
+    vk.flags=0x0000 ascii=False raw_name=b'V\x00a\x00l\x00'
+    value.name() -> 'Val'
+    value.value()-> 'plain-val'
+
+lookup tests:
+  open('Visible') -> path='ROOT\\Visible' marker=''
+  open('Visible\x00Hidden') -> path='ROOT\\Visible\x00Hidden' marker=''
+  open('a\\b') -> path='ROOT\\a\\b' marker=''
+  open('a') -> path='ROOT\\a' marker=''
+  open('Values') -> path='ROOT\\Values' marker=''
+value() lookups on Values key:
+  value('Val') -> name='Val' data='plain-val'
+  value('Val\x00Suffix') -> name='Val\x00Suffix' data='nul-value-name'
+  value('TruncData') -> name='TruncData' data='abc'
+  value('CjkData') -> name='CjkData' data='abc\xc0\u4e00'
+
+raw bytes behind CjkData (what decode_utf16le saw):
+  raw_data: b'a\x00b\x00c\x00\xc0\x00\x00Nd\x00e\x00f\x00\x00\x00'
+  parsed  : 'abc\xc0\u4e00'
+  overrun=16: 'abc\xc0\u4e00def\x00'
+
+========================================================================
+HIVE 5: value literally named '(default)' vs real default
+========================================================================
+enumeration (ground truth):
+  name='(default)' has_name=False data='REAL-DEFAULT'
+  name='(default)' has_name=True data='NAMED-(default)'
+lookup value('(default)'):
+  -> name='(default)' data='REAL-DEFAULT'
+lookup value(''):
+  -> name='(default)' data='REAL-DEFAULT'
+
+========================================================================
+ROUND-TRIP: does open(path-without-root) return the same key?
+========================================================================
+[compressed_names.hive]
+  path='ROOT\\PlainASCII' reopen=OK
+  path='ROOT\\\xdcn\xefcode' reopen=OK
+  path='ROOT\\CJK\u952e' reopen=OK
+  path='ROOT\\F\x00l\x00a\x00g\x00L\x00i\x00e\x00' reopen=OK
+  path='ROOT\\\u6152\u4277\u7479\u7365' reopen=OK
+  path="<UnicodeDecodeError: 'utf-16-le' codec can't decode byte 0x41 in position 12: truncated data>" reopen=RegistryKey(name="ROOT", path="ROOT")
+[nul_separator.hive]
+  path='ROOT\\Visible\x00Hidden' reopen=OK
+  path='ROOT\\Visible' reopen=OK
+  path='ROOT\\a\\b' reopen=OK
+  path='ROOT\\a' reopen=OK
+  path='ROOT\\a\\b' reopen=OK
+  path='ROOT\\Values' reopen=OK
+[surrogate_names.hive]
+  path='ROOT\\Emoji\U0001f600Key' reopen=OK
+  path="<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal UTF-16 surrogate>" reopen=RegistryKey(name="ROOT", path="ROOT")
+  path="<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 14-15: illegal encoding>" reopen=RegistryKey(name="ROOT", path="ROOT")
+  path="<UnicodeDecodeError: 'utf-16-le' codec can't decode bytes in position 16-17: illegal encoding>" reopen=RegistryKey(name="ROOT", path="ROOT")
