@@ -26,6 +26,8 @@ import struct
 import datetime
 import decimal
 import binascii
+import bisect
+from array import array
 from ctypes import c_uint32
 from enum import Enum
 from collections import namedtuple
@@ -81,6 +83,11 @@ RegUnicodeStringArray = 0x11F
 # Constants to support the transaction log files (new format)
 LOG_ENTRY_SIZE_HEADER = 40
 LOG_ENTRY_SIZE_ALIGNMENT = 0x200
+
+# Maximum number of payload bytes stored in one segment of a "db" (large data)
+# chain. Segment cells may have room for a few more bytes, but only this many
+# are consumed per segment, matching the on-disk format.
+DB_SEGMENT_SIZE = 0x3FD8
 
 class FileType(Enum):
     FILE_TYPE_PRIMARY = 0
@@ -222,6 +229,27 @@ class NotSupportedException(RegistryException):
     def __str__(self):
         return "Not Supported Exception (%s)" % (self._value)
 
+
+class LargeDataParseException(ParseException):
+    """
+    Raised when a large data ("db") segment chain is malformed.
+
+    This covers chains that would read past the end of a segment cell (into a
+    neighbouring cell), that reference the same segment twice, or whose
+    declared length cannot be satisfied by the chain.  A physically truncated
+    hive file is not an error: the reader returns the prefix that is present.
+    """
+    def __init__(self, value):
+        """
+        Constructor.
+        Arguments:
+        - `value`: A string description.
+        """
+        super(LargeDataParseException, self).__init__(value)
+
+    def __str__(self):
+        return "Large Data Parse Exception (%s)" % (self._value)
+
 class RegistryBlock(object):
     """
     Base class for structure blocks in the Windows Registry.
@@ -285,8 +313,20 @@ class RegistryBlock(object):
         Arguments:
         - `offset`: The relative offset from the start of the block.
         - `length`: The length of the string.
+
+        A declared length is only used to size a single ``struct`` unpack, so
+        a corrupted length (e.g. a 16 bit name length of 0xFFFB) is rejected
+        before it is used to build the format string.
         """
-        return struct.unpack_from(str("<%ds") % (length), self._buf, self._offset + offset)[0]
+        if length < 0:
+            raise ParseException(
+                "negative string length %d at 0x%x" % (length, self._offset + offset))
+        start = self._offset + offset
+        if start < 0 or start + length > len(self._buf):
+            raise ParseException(
+                "string of %d bytes at 0x%x does not fit in the hive buffer" %
+                (length, start))
+        return struct.unpack_from(str("<%ds") % (length), self._buf, start)[0]
 
     def absolute_offset(self, offset):
         """
@@ -558,7 +598,14 @@ class HBINCell(RegistryBlock):
         - `parent`: The parent block, which links to this block.
         """
         super(HBINCell, self).__init__(buf, offset, parent)
-        self._size = self.unpack_int(0x0)
+        try:
+            self._size = self.unpack_int(0x0)
+        except struct.error:
+            # A cell that does not fit inside the hive buffer is a structural
+            # corruption, not an internal error.  Report it as such so callers
+            # can catch one stable exception family.
+            raise RegistryStructureDoesNotExist(
+                "HBINCell at 0x%x lies outside the hive buffer" % self._offset)
 
     def __str__(self):
         if self.is_free():
@@ -609,8 +656,61 @@ class HBINCell(RegistryBlock):
     def raw_data(self):
         """
         Get the raw data from the buffer contained by this HBINCell.
+
+        The four byte cell size field is not part of the payload, so the
+        returned slice never includes bytes that belong to the next cell.
+        If the hive file is physically truncated, only the bytes that are
+        actually present are returned.
         """
-        return self._buf[self.data_offset():self.data_offset() + self.size()]
+        capacity = self.size() - 0x4
+        if capacity <= 0:
+            return b""
+        start = self.data_offset()
+        if start >= len(self._buf):
+            return b""
+        return self._buf[start:min(start + capacity, len(self._buf))]
+
+    def payload(self, length):
+        """
+        Get up to `length` bytes of this cell's payload.
+
+        This is the strict accessor used when assembling large ("db") values.
+        It refuses to cross the end of the cell, which would otherwise splice
+        bytes of a neighbouring cell into the value.
+
+        Arguments:
+        - `length`: number of payload bytes requested.
+        @raises LargeDataParseException: if `length` is larger than the cell
+            payload, if the cell is free, or if its size field is invalid.
+
+        If the hive file is physically truncated, the available prefix is
+        returned instead of raising.
+        """
+        if self.is_free():
+            raise LargeDataParseException("cell at 0x%x is free" % (self.offset()))
+
+        capacity = self.size() - 0x4
+        if capacity < 0:
+            raise LargeDataParseException(
+                "cell at 0x%x has an invalid size 0x%x" % (self.offset(), self.size()))
+        if length < 0:
+            raise LargeDataParseException("negative data length requested")
+        if length > capacity:
+            raise LargeDataParseException(
+                "cell at 0x%x holds %d payload bytes but %d were requested; "
+                "refusing to read into neighbouring cells" %
+                (self.offset(), capacity, length))
+
+        start = self.data_offset()
+        if start >= len(self._buf):
+            return b""
+        return self._buf[start:min(start + length, len(self._buf))]
+
+    def payload_capacity(self):
+        """
+        Get the number of payload bytes this cell can hold.
+        """
+        return max(0, self.size() - 0x4)
 
     def data_id(self):
         """
@@ -686,6 +786,142 @@ class Record(RegistryBlock):
 
         return h.first_hbin().offset() + offset
 
+    # -- Cell geometry ------------------------------------------------------
+    #
+    # Data pointers inside a hive are offsets relative to the first HBIN, and
+    # they are allowed to name any byte.  A pointer that lands in the middle of
+    # a cell, however, would make the reader interpret payload bytes as a cell
+    # size field and splice a neighbouring cell into the value.  Records that
+    # assemble data from arbitrary offsets therefore validate that the offset
+    # begins a cell.
+
+    def _hbin_header(self):
+        """
+        Walk the parent links to the REGF header.
+
+        The chain is built from untrusted structures, so a broken or cyclic
+        chain is reported as a large data error instead of leaking an
+        AttributeError or struct.error.  REGFBlock is reached directly (rather
+        than via HBINBlock) so this stays cheap enough to run per value read.
+        """
+        try:
+            node = self
+            seen = set()
+            while node is not None and node.__class__.__name__ != "REGFBlock":
+                if id(node) in seen:
+                    raise LargeDataParseException(
+                        "parent chain of the block at 0x%x is cyclic" %
+                        self.offset())
+                seen.add(id(node))
+                node = node.parent()
+
+            if node is None:
+                raise LargeDataParseException(
+                    "block at 0x%x is not contained in an HBIN" % self.offset())
+            return node
+        except LargeDataParseException:
+            raise
+        except (AttributeError, TypeError, struct.error) as e:
+            raise LargeDataParseException(
+                "block at 0x%x has a malformed parent chain (%s)" %
+                (self.offset(), e))
+
+    def _hbin_bounds(self):
+        """
+        Absolute (start, end) of the HBIN region described by the hive header.
+
+        Segment offsets are relative to the first HBIN, so an offset that
+        resolves outside this region is bogus.  An offset inside the region
+        but beyond the end of the file means the file was truncated.
+        """
+        regf = self._hbin_header()
+        start = regf.first_hbin_offset()
+        return start, start + regf.hbins_size()
+
+    @staticmethod
+    def _collect_geometry(buf, start, end):
+        """
+        Walk the HBIN chain and index the cells of every HBIN.
+
+        HBINs are chained by the "offset of the next HBIN" dword at +0x8, and
+        each carries its own 0x20 byte header, so cells only tile within one
+        HBIN.  The region described by the header bounds the walk; a broken
+        chain ends it rather than looping or reading past the file.
+
+        Returns ``(hbin_starts, ranges, cell_starts)`` where ``hbin_starts`` is
+        a sorted array for bisecting the containing HBIN and ``cell_starts[i]``
+        is the sorted cell start array of ``ranges[i]``.
+        """
+        limit = min(end, len(buf))
+        hbin_starts = array("I")
+        ranges = []
+        cell_starts = []
+
+        offset = start
+        while offset + 0x20 <= limit:
+            if buf[offset:offset + 0x4] != b"hbin":
+                break
+            next_offset = offset + struct.unpack_from("<I", buf,
+                                                      offset + 0x8)[0]
+            if next_offset <= offset or next_offset > end:
+                break
+
+            starts = array("I")
+            cell = offset + 0x20
+            cell_limit = min(next_offset, limit)
+            while cell + 0x4 <= cell_limit:
+                starts.append(cell)
+                size = struct.unpack_from("<i", buf, cell)[0]
+                size = -size if size < 0 else size
+                if size < 0x4:
+                    break
+                cell += size
+
+            hbin_starts.append(offset)
+            ranges.append((offset, next_offset))
+            cell_starts.append(starts)
+            offset = next_offset
+
+        return hbin_starts, ranges, cell_starts
+
+    def _geometry_cache(self):
+        """
+        Per-hive cache of the HBIN ranges and cell start indexes.
+
+        Building the index walks every cell in the hive, which is far too
+        expensive to repeat for every value read.  The hive buffer is immutable
+        once owned by REGFBlock, so the index is computed once and shared by
+        every record in that hive.
+        """
+        regf = self._hbin_header()
+        cache = getattr(regf, "_cell_geometry", None)
+        if cache is None:
+            start = regf.first_hbin_offset()
+            cache = self._collect_geometry(self._buf, start,
+                                           start + regf.hbins_size())
+            regf._cell_geometry = cache
+        return cache
+
+    def is_cell_start(self, absolute_offset):
+        """
+        Does `absolute_offset` begin a cell of the HBIN that contains it?
+
+        Raises LargeDataParseException if the offset is outside every HBIN.
+        """
+        hbin_starts, ranges, cell_starts = self._geometry_cache()
+
+        position = bisect.bisect_right(hbin_starts, absolute_offset) - 1
+        if position >= 0:
+            hbin_start, hbin_end = ranges[position]
+            if hbin_start <= absolute_offset < hbin_end:
+                offsets = cell_starts[position]
+                index = bisect.bisect_left(offsets, absolute_offset)
+                return index < len(offsets) and offsets[index] == absolute_offset
+
+        raise LargeDataParseException(
+            "offset 0x%x is outside the HBIN region of the hive" %
+            absolute_offset)
+
 
 class DataRecord(Record):
     """
@@ -710,7 +946,11 @@ class DataRecord(Record):
 class DBIndirectBlock(Record):
     """
     The DBIndirect block is a list of offsets to DataRecords with data
-    size up to 0x3fd8.
+    size up to DB_SEGMENT_SIZE.
+
+    Writing: the list of dwords follows the four byte size field of the
+    HBINCell that contains this block.  Only dwords that actually fit in that
+    cell are valid segment references; the reader never reads past the cell.
     """
     def __init__(self, buf, offset, parent):
         """
@@ -725,21 +965,136 @@ class DBIndirectBlock(Record):
     def __str__(self):
         return "Large Data Block at 0x%x" % (self.offset())
 
+    def _entry_capacity(self):
+        """
+        Number of segment offsets that are physically part of this block.
+
+        The indirect block lives inside an HBINCell, so its extent ends where
+        that cell's payload ends (or where the buffer ends, if the file is
+        truncated).  It never extends into a neighbouring cell, and it never
+        extends past the end of the HBIN region described by the file header.
+        """
+        available = len(self._buf) - self._offset
+        if available < 0:
+            return 0
+
+        hbin_start, hbin_end = self._hbin_bounds()
+        available = min(available, hbin_end - self._offset)
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "payload_capacity"):
+            available = min(available, parent.payload_capacity())
+
+        return max(0, available) // 0x4
+
+    def _require_cell_start(self, absolute_offset, description):
+        """
+        Raise unless `absolute_offset` begins a cell of its HBIN.
+
+        This is what keeps a chain that points into the middle of a cell from
+        interpreting data bytes as a cell size and splicing a neighbouring
+        cell into the value.
+        """
+        if not self.is_cell_start(absolute_offset):
+            raise LargeDataParseException(
+                "%s offset 0x%x is not the start of an HBIN cell" %
+                (description, absolute_offset))
+
+    def _segment_cell(self, absolute_offset):
+        """
+        Build the HBINCell for a segment reference, validating that the
+        reference points at a real cell within the HBIN region.
+
+        Returns `None` if the file is physically truncated before the cell,
+        which callers translate into a truncated (prefix-only) result.
+        """
+        hbin_start, hbin_end = self._hbin_bounds()
+
+        if absolute_offset < hbin_start + 0x20 or absolute_offset >= hbin_end:
+            raise LargeDataParseException(
+                "large data segment offset 0x%x is outside the HBIN region "
+                "0x%x-0x%x" % (absolute_offset, hbin_start, hbin_end))
+
+        if absolute_offset >= len(self._buf):
+            # Within the declared hive, but the file ends first.
+            return None
+
+        if len(self._buf) - absolute_offset < 0x4:
+            return None
+
+        cell = HBINCell(self._buf, absolute_offset, self)
+        if cell.is_free():
+            raise LargeDataParseException(
+                "large data segment at 0x%x is a free cell" % absolute_offset)
+        if cell.size() < 0x8:
+            raise LargeDataParseException(
+                "large data segment at 0x%x has an invalid size 0x%x" %
+                (absolute_offset, cell.size()))
+        if absolute_offset + cell.size() > hbin_end:
+            raise LargeDataParseException(
+                "large data segment at 0x%x (size 0x%x) extends past the end "
+                "of the HBIN region at 0x%x" %
+                (absolute_offset, cell.size(), hbin_end))
+        self._require_cell_start(absolute_offset, "large data segment")
+        return cell
+
     def large_data(self, length):
         """
         Get the data pointed to by the indirect block. It may be large.
         Return a byte string.
+
+        The declared `length` is validated before anything is allocated:
+        a length larger than the hive itself, or one that needs more segment
+        entries than this block physically contains, is rejected.  Segment
+        references may not repeat and may not point outside their cell.
+        A physically truncated file yields the available prefix.
         """
-        b = bytearray()
+        if length < 0:
+            raise LargeDataParseException("negative large data length")
+
+        if length > len(self._buf):
+            raise LargeDataParseException(
+                "declared large data length %d exceeds the size of the hive "
+                "(0x%x bytes); refusing to allocate" % (length, len(self._buf)))
+
+        entry_capacity = self._entry_capacity()
+        needed = (length + DB_SEGMENT_SIZE - 1) // DB_SEGMENT_SIZE
+        if needed > entry_capacity:
+            raise LargeDataParseException(
+                "declared large data length %d needs %d segments but the "
+                "indirect block at 0x%x only holds %d" %
+                (length, needed, self.offset(), entry_capacity))
+
+        result = bytearray()
+        seen = set()
         count = 0
+
         while length > 0:
-            off = self.abs_offset_from_hbin_offset(self.unpack_dword(4 * count))
-            size = min(0x3fd8, length)
-            b += HBINCell(self._buf, off, self).raw_data()[0:size]
+            relative_offset = self.unpack_dword(4 * count)
+            absolute_offset = self.abs_offset_from_hbin_offset(relative_offset)
+
+            if absolute_offset in seen:
+                raise LargeDataParseException(
+                    "large data segment at 0x%x is referenced more than once" %
+                    absolute_offset)
+            seen.add(absolute_offset)
+
+            cell = self._segment_cell(absolute_offset)
+            if cell is None:
+                # Truncated hive: return exactly what is present.
+                break
+
+            take = min(DB_SEGMENT_SIZE, length)
+            piece = cell.payload(take)
+            result += piece
+            if len(piece) < take:
+                # The file ended inside this segment cell.
+                break
 
             count += 1
-            length -= size
-        return bytes(b)
+            length -= take
+
+        return bytes(result)
 
 
 class DBRecord(Record):
@@ -769,8 +1124,36 @@ class DBRecord(Record):
         Get the data described by the DBRecord. It may be large.
         Return a byte array.
         """
-        off = self.abs_offset_from_hbin_offset(self.unpack_dword(0x4))
+        if length < 0:
+            raise LargeDataParseException("negative large data length")
+        if length > len(self._buf):
+            raise LargeDataParseException(
+                "declared large data length %d exceeds the size of the hive "
+                "(0x%x bytes); refusing to allocate" % (length, len(self._buf)))
+
+        relative_offset = self.unpack_dword(0x4)
+        off = self.abs_offset_from_hbin_offset(relative_offset)
+
+        # Reuse the indirect block's HBIN bounds logic by constructing the
+        # block only once the target has been sanity checked.
+        probe = DBIndirectBlock(self._buf, off, self)
+        hbin_start, hbin_end = probe._hbin_bounds()
+        if off < hbin_start + 0x20 or off >= hbin_end:
+            raise LargeDataParseException(
+                "large data indirect block offset 0x%x is outside the HBIN "
+                "region 0x%x-0x%x" % (off, hbin_start, hbin_end))
+        if off >= len(self._buf) or len(self._buf) - off < 0x4:
+            # Truncated hive: no indirect block is present.
+            return b""
+
         cell = HBINCell(self._buf, off, self)
+        if cell.is_free():
+            raise LargeDataParseException(
+                "large data indirect block at 0x%x is a free cell" % off)
+        # A pointer into the middle of a cell would let data bytes pose as a
+        # cell size, so the indirect block must itself start a cell.
+        probe._require_cell_start(off, "large data indirect block")
+
         dbi = DBIndirectBlock(self._buf, cell.data_offset(), cell)
         return dbi.large_data(length)
 
@@ -1031,111 +1414,167 @@ class VKRecord(Record):
         else:
             return self.abs_offset_from_hbin_offset(self.unpack_dword(0x8))
 
+    def _inline_data(self, length, overrun=0):
+        """
+        Read data that is stored in the 4 byte field at offset 0x8.
+
+        The field is only four bytes wide, so a declared inline length (or an
+        `overrun` larger than that) is clamped: the result can never spill into
+        the trailing data type / flags fields.
+        """
+        start = self.absolute_offset(0x8)
+        wanted = min(max(0, length + overrun), 0x4)
+        return self._buf[start:start + wanted]
+
+    def _cell_data(self, absolute_offset, length, overrun=0):
+        """
+        Read up to `length + overrun` bytes from the payload of the HBINCell
+        at `absolute_offset`.
+
+        The offset must begin a cell: a pointer into the middle of a cell would
+        turn payload bytes into a forged size field and splice a neighbouring
+        cell into the value, so it is rejected.  The read is additionally
+        bounded by the cell's own payload.  If the hive file is truncated, the
+        available prefix is returned.
+        """
+        if absolute_offset < 0 or absolute_offset >= len(self._buf):
+            return b""
+        if len(self._buf) - absolute_offset < 0x4:
+            return b""
+
+        if not self.is_cell_start(absolute_offset):
+            raise LargeDataParseException(
+                "value data offset 0x%x is not the start of an HBIN cell" %
+                absolute_offset)
+
+        cell = HBINCell(self._buf, absolute_offset, self)
+        if cell.is_free():
+            return b""
+
+        wanted = min(max(0, length + overrun), cell.payload_capacity())
+        start = cell.data_offset()
+        return self._buf[start:min(start + wanted, len(self._buf))]
+
+    def _large_data(self, data_length, overrun=0):
+        """
+        Read a value whose length exceeds DB_SEGMENT_SIZE.
+
+        The value is normally described by a "db" record.  If the cell is not a
+        db record (empirically this happens), fall back to a bounded read of
+        the cell payload instead of reading past the cell.
+        """
+        data_offset = self.data_offset()
+        if data_offset < 0 or data_offset >= len(self._buf):
+            return b""
+        if len(self._buf) - data_offset < 0x6:
+            return b""
+
+        # The "db" record must start a cell; otherwise the id bytes could be
+        # payload that merely looks like "db".
+        if not self.is_cell_start(data_offset):
+            raise LargeDataParseException(
+                "value data offset 0x%x is not the start of an HBIN cell" %
+                data_offset)
+
+        cell = HBINCell(self._buf, data_offset, self)
+        if not cell.is_free() and cell.data_id() == b"db":
+            return cell.child().large_data(data_length + overrun)
+
+        return self._cell_data(data_offset, data_length, overrun)
+
     def raw_data(self, overrun=0):
         """
         Get the unparsed raw data.
+
+        All reads are bounded either by the inline four byte field or by the
+        payload of the HBINCell that holds the data.  As a result raw and typed
+        reads observe exactly the same bytes: a value never contains bytes of
+        its neighbouring cells, and a declared length can never cause an
+        unbounded allocation.  Physically truncated hives yield the prefix
+        that is present.
         """
         data_type = self.data_type()
-        data_length = self.raw_data_length()
-        data_offset = self.data_offset()
-        ret = None
+        raw_length = self.raw_data_length()
+        # Data of up to four bytes is stored directly in the 0x8 dword.  The
+        # on-disk format also sets the high bit to say so, but some writers
+        # omit the flag, so the length alone is enough to decide.
+        data_length = raw_length & 0x7FFFFFFF
+        inline = raw_length >= 0x80000000 or data_length <= 0x4
 
         if data_type == RegSZ or data_type == RegExpandSZ:
-            if data_length >= 0x80000000:
+            if inline:
                 # data is contained in the data_offset field
-                ret = self._buf[data_offset:data_offset + 0x4]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    ret = d.child().large_data(data_length + overrun)
-                else:
-                    ret = d.raw_data()[:data_length + overrun]
-            else:
-                d = HBINCell(self._buf, data_offset, self)
-                data_offset = d.data_offset()
-                ret = self._buf[data_offset:data_offset + data_length]
-        elif data_type == RegBin or data_type == RegNone \
-             or data_type in (RegUint8, RegInt16, RegUint16, RegInt32, RegUint32, 
-                              RegInt64, RegUint64, RegFloat, RegDouble, RegUnicodeChar, 
-                              RegBoolean, RegUnicodeString, RegCompositeValue,RegDateTimeOffset, 
-                              RegTimeSpan, RegGUID, RegUnk111, RegUnk112, RegUnk113, RegBytesArray, 
-                              RegInt16Array, RegUint16Array, RegInt32Array, RegUInt32Array, 
-                              RegInt64Array, RegUInt64Array, RegFloatArray, RegDoubleArray, 
+                return self._inline_data(0x4, overrun)
+            if data_length > DB_SEGMENT_SIZE:
+                return self._large_data(data_length, overrun)
+            return self._cell_data(self.data_offset(), data_length, overrun)
+
+        if data_type == RegBin or data_type == RegNone \
+             or data_type in (RegUint8, RegInt16, RegUint16, RegInt32, RegUint32,
+                              RegInt64, RegUint64, RegFloat, RegDouble, RegUnicodeChar,
+                              RegBoolean, RegUnicodeString, RegCompositeValue, RegDateTimeOffset,
+                              RegTimeSpan, RegGUID, RegUnk111, RegUnk112, RegUnk113, RegBytesArray,
+                              RegInt16Array, RegUint16Array, RegInt32Array, RegUInt32Array,
+                              RegInt64Array, RegUInt64Array, RegFloatArray, RegDoubleArray,
                               RegUnicodeCharArray, RegBooleanArray, RegUnicodeStringArray):
-            if data_length >= 0x80000000:
-                data_length -= 0x80000000
-                ret = self._buf[data_offset:data_offset + data_length + overrun]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    ret = d.child().large_data(data_length + overrun)
-                else:
-                    ret = d.raw_data()[:data_length + overrun]
-            else:
-                ret = self._buf[data_offset + 4:data_offset + 4 + data_length + overrun]
-        elif data_type == RegDWord:
-            ret = self.unpack_binary(0x8, 0x4)
-        elif data_type == RegMultiSZ:
-            if data_length >= 0x80000000:
+            if inline:
+                return self._inline_data(data_length, overrun)
+            if data_length > DB_SEGMENT_SIZE:
+                return self._large_data(data_length, overrun)
+            return self._cell_data(self.data_offset(), data_length, overrun)
+
+        if data_type == RegDWord:
+            return self.unpack_binary(0x8, 0x4)
+
+        if data_type == RegMultiSZ:
+            if inline:
                 # this means data_length < 5, so it must be 4, and
                 # be composed of completely \x00, so the strings are empty
-                ret = b""
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    ret = d.child().large_data(data_length + overrun)
-                else:
-                    ret = d.raw_data()[:data_length + overrun]
-            else:
-                ret = self._buf[data_offset + 4:data_offset + 4 + data_length + overrun]
-        elif data_type == RegQWord:
-            d = HBINCell(self._buf, data_offset, self)
-            data_offset = d.data_offset()
-            ret = self._buf[data_offset:data_offset + 0x8]
-        elif data_type == RegBigEndian:
-            d = HBINCell(self._buf, data_offset, self)
-            data_offset = d.data_offset()
-            ret = self._buf[data_offset:data_offset + 4]
-        elif data_type == RegLink or \
+                return b""
+            if data_length > DB_SEGMENT_SIZE:
+                return self._large_data(data_length, overrun)
+            return self._cell_data(self.data_offset(), data_length, overrun)
+
+        if data_type == RegQWord:
+            return self._cell_data(self.data_offset(), 0x8)
+
+        if data_type == RegBigEndian:
+            return self._cell_data(self.data_offset(), 0x4)
+
+        if data_type == RegLink or \
                         data_type == RegResourceList or \
                         data_type == RegFullResourceDescriptor or \
                         data_type == RegResourceRequirementsList:
-            if data_length >= 0x80000000:
-                data_length -= 0x80000000
-                ret = self._buf[data_offset:data_offset + data_length]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    ret = d.child().large_data(data_length)
-                else:
-                    ret = d.raw_data()[:data_length]
-            else:
-                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
-        elif data_type == RegFileTime:
-            ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
-        elif data_length < 5 or data_length >= 0x80000000:
-            ret = self.unpack_binary(0x8, 4)
-        else:
-            if data_length >= 0x80000000:
-                data_length -= 0x80000000
-                ret = self._buf[data_offset:data_offset + data_length]
-            elif 0x3fd8 < data_length < 0x80000000:
-                d = HBINCell(self._buf, data_offset, self)
-                if d.data_id() == b"db":
-                    # this should always be the case
-                    # but empirical testing does not confirm this
-                    ret = d.child().large_data(data_length)
-                else:
-                    ret = d.raw_data()[:data_length]
-            else:
-                ret = self._buf[data_offset + 4:data_offset + 4 + data_length]
-        return ret
+            if inline:
+                return self._inline_data(data_length)
+            if data_length > DB_SEGMENT_SIZE:
+                return self._large_data(data_length)
+            return self._cell_data(self.data_offset(), data_length)
+
+        if data_type == RegFileTime:
+            return self._cell_data(self.data_offset(), data_length)
+
+        if inline or data_length < 5:
+            return self.unpack_binary(0x8, 0x4)
+
+        if data_length > DB_SEGMENT_SIZE:
+            return self._large_data(data_length)
+
+        return self._cell_data(self.data_offset(), data_length)
+
+    def _unpack_data(self, fmt, data):
+        """
+        Unpack a fixed-size scalar from value data.
+
+        A short read (for example, a truncated hive or a cell whose declared
+        length cannot be satisfied) is reported as a stable
+        LargeDataParseException instead of leaking a ``struct.error``.
+        """
+        try:
+            return struct.unpack_from(fmt, data, 0)[0]
+        except struct.error as e:
+            raise LargeDataParseException(
+                "value at 0x%x is truncated (%s)" % (self.offset(), e))
 
     def data(self, overrun=0):
         """
@@ -1185,14 +1624,14 @@ class VKRecord(Record):
         elif data_type == RegBin or data_type == RegNone:
             return d
         elif data_type == RegDWord:
-            return struct.unpack_from(str("<I"), d, 0)[0]
+            return self._unpack_data(str("<I"), d)
         elif data_type == RegMultiSZ:
             s = d.decode("utf16")
             return s.split("\x00")
         elif data_type == RegQWord:
-            return struct.unpack_from(str("<Q"), d, 0)[0]
+            return self._unpack_data(str("<Q"), d)
         elif data_type == RegBigEndian:
-            return struct.unpack_from(str(">I"), d, 0)[0]
+            return self._unpack_data(str(">I"), d)
         elif data_type == RegLink or \
                         data_type == RegResourceList or \
                         data_type == RegFullResourceDescriptor or \
@@ -1200,20 +1639,27 @@ class VKRecord(Record):
             # we don't really support these types, but can at least
             #  return raw binary for someone else to work with.
             return d
-        elif data_type in (RegUint8, RegInt16, RegUint16, RegInt32, RegUint32, 
-                        RegInt64, RegUint64, RegFloat, RegDouble, RegUnicodeChar, 
-                        RegBoolean, RegUnicodeString, RegCompositeValue,RegDateTimeOffset, 
-                        RegTimeSpan, RegGUID, RegUnk111, RegUnk112, RegUnk113, RegBytesArray, 
-                        RegInt16Array, RegUint16Array, RegInt32Array, RegUInt32Array, 
-                        RegInt64Array, RegUInt64Array, RegFloatArray, RegDoubleArray, 
+        elif data_type in (RegUint8, RegInt16, RegUint16, RegInt32, RegUint32,
+                        RegInt64, RegUint64, RegFloat, RegDouble, RegUnicodeChar,
+                        RegBoolean, RegUnicodeString, RegCompositeValue,RegDateTimeOffset,
+                        RegTimeSpan, RegGUID, RegUnk111, RegUnk112, RegUnk113, RegBytesArray,
+                        RegInt16Array, RegUint16Array, RegInt32Array, RegUInt32Array,
+                        RegInt64Array, RegUInt64Array, RegFloatArray, RegDoubleArray,
                         RegUnicodeCharArray, RegBooleanArray, RegUnicodeStringArray):
             d = d[0:-8] # remove timestamp from end
             comp_type = data_type & 0xEFF # Apply mask for composite types
-            return SettingsParse.ParseAppDataCompositeValue(comp_type, d, len(d))
+            try:
+                return SettingsParse.ParseAppDataCompositeValue(comp_type, d, len(d))
+            except struct.error as e:
+                # The composite stream is untrusted; a short or malformed
+                # record is a parse failure, not an internal error.
+                raise LargeDataParseException(
+                    "composite value at 0x%x is truncated (%s)" %
+                    (self.offset(), e))
         elif data_type == RegFileTime:
-            return parse_windows_timestamp(struct.unpack_from(str("<Q"), d, 0)[0])
+            return parse_windows_timestamp(self._unpack_data(str("<Q"), d))
         elif data_length < 5 or data_length >= 0x80000000:
-            return struct.unpack_from(str("<I"), d, 0)[0]
+            return self._unpack_data(str("<I"), d)
         else:
             raise UnknownTypeException("Unknown VK Record type 0x%x at 0x%x" % (data_type, self.offset()))
 
@@ -1673,11 +2119,18 @@ class HBINBlock(RegistryBlock):
         """
         super(HBINBlock, self).__init__(buf, offset, parent)
 
-        _id = self.unpack_dword(0)
+        try:
+            _id = self.unpack_dword(0)
+            self._reloffset_next_hbin = self.unpack_dword(0x8)
+        except struct.error:
+            # A header that does not fit in the hive buffer means the block
+            # offset is corrupt; report it as a parse failure.
+            raise ParseException(
+                "HBIN at 0x%x lies outside the hive buffer" % self._offset)
+
         if _id != 0x6E696268:
             raise ParseException("Invalid HBIN ID")
 
-        self._reloffset_next_hbin = self.unpack_dword(0x8)
         self._offset_next_hbin = self._reloffset_next_hbin + self._offset
 
     def __str__(self):
@@ -1687,7 +2140,11 @@ class HBINBlock(RegistryBlock):
         """
         Get the first HBINBlock.
         """
-        reloffset_from_first_hbin = self.unpack_dword(0x4)
+        try:
+            reloffset_from_first_hbin = self.unpack_dword(0x4)
+        except struct.error:
+            raise ParseException(
+                "HBIN at 0x%x lies outside the hive buffer" % self._offset)
         return HBINBlock(self._buf, (self.offset() - reloffset_from_first_hbin), self.parent())
 
     def has_next(self):

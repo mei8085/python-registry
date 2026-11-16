@@ -1,3 +1,14 @@
+unreleased
+  - large ("db") values: raw and typed reads now share one boundary. Segment
+    chains are assembled only from the payload of the cells they name, so
+    neighbour cells are never spliced in and a declared length can no longer
+    cause an unbounded allocation. Out-of-range index/offset, repeated segment,
+    cell-size overrun, free/mid-cell pointer and declared-length overflow raise
+    the new LargeDataParseException; a physically truncated hive returns the
+    prefix that is present. Values of <= 4 bytes written without the inline
+    high bit are read from the inline dword. adds integration tests and
+    replayable hive fixtures under tests/reg_samples/db_chain
+
 1.2.0
   - [DEPRECATED] records() in HBINBlock, use the more correct cells() instead, by @NiKiZe
   - fix bug in parsing of resident values with length zero, reported and patched by @BridgeyTheGeek
