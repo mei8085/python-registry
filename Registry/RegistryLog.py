@@ -129,6 +129,28 @@ class RegistryLog(object):
         self._primary.seek(offset_primary)
         self._primary.write(dirty_data)
 
+    def validate_dirty_pages(self, log_entry):
+        """
+        Check that all dirty pages of a log entry are consistent with the entry's
+        declared length and stay within the hive boundary (the entry's hbins_size).
+        Raises RegistryParse.ParseException when a malicious or corrupt dirty page
+        is found. This must be called before any dirty page of the entry is written,
+        so that a rejected entry leaves the primary file untouched.
+        """
+        entry_end = log_entry.offset() + log_entry.size()
+        hbins_size = log_entry.hbins_size()
+        current_offset = log_entry.first_dirty_page_offset()
+        for dirty_page_reference in log_entry.dirty_pages_references():
+            offset = dirty_page_reference.offset()
+            size = dirty_page_reference.size()
+            if size == 0 or current_offset + size > entry_end:
+                raise RegistryParse.ParseException(
+                    "Dirty page data exceeds the declared log entry length")
+            if offset + size > hbins_size:
+                raise RegistryParse.ParseException(
+                    "Dirty page target range crosses the hive boundary")
+            current_offset += size
+
     def update_regf_header(self, hive_sequence, hbins_size, hive_flags):
         """
         Update the REGF block of the primary file with the new hive_sequence1, hive_sequence2, hbins_size, and hive_flags.
@@ -172,16 +194,23 @@ class RegistryLog(object):
             self.reload_primary_regf()
 
         if recover.recover_data:
+            last_sequence = None
             for log_entry in self._regf.log_entries():
+                self.validate_dirty_pages(log_entry)
                 for dirty_page_reference, dirty_page in log_entry.dirty_pages_with_references():
                     self.write_dirty_page(dirty_page_reference, dirty_page)
 
                 self._hive_flags = log_entry.hive_flags()
                 self._hive_sequence = log_entry.sequence()
                 self._hbins_size = log_entry.hbins_size()
+                last_sequence = log_entry.sequence()
+
+            if last_sequence is None:
+                # No valid log entries (e.g. a truncated log); leave the primary file untouched.
+                return None
 
             self.update_regf_header(self.latest_hive_sequence(), self.latest_hbins_size(), self.latest_hive_flags())
-            return log_entry.sequence()
+            return last_sequence
 
     def recover_hive_continue(self, expected_sequence):
         """
@@ -191,13 +220,20 @@ class RegistryLog(object):
         if expected_sequence != self._regf.hive_sequence2():
             return None
 
+        last_sequence = None
         for log_entry in self._regf.log_entries():
+            self.validate_dirty_pages(log_entry)
             for dirty_page_reference, dirty_page in log_entry.dirty_pages_with_references():
                 self.write_dirty_page(dirty_page_reference, dirty_page)
 
             self._hive_flags = log_entry.hive_flags()
             self._hive_sequence = log_entry.sequence()
             self._hbins_size = log_entry.hbins_size()
+            last_sequence = log_entry.sequence()
+
+        if last_sequence is None:
+            # No valid log entries (e.g. a truncated log); leave the primary file untouched.
+            return None
 
         self.update_regf_header(self.latest_hive_sequence(), self.latest_hbins_size(), self.latest_hive_flags())
-        return log_entry.sequence()
+        return last_sequence

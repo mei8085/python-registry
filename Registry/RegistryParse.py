@@ -531,7 +531,11 @@ class REGFBlock(RegistryBlock):
         A generator that enumerates all valid HvLE (HvLEBlock) structures in the transaction log file.
         """
         expected_seqnum = c_uint32(self.hive_sequence2())
-        h = HvLEBlock(self._buf, self.first_log_entry_offset(), self)
+        try:
+            h = HvLEBlock(self._buf, self.first_log_entry_offset(), self)
+        except struct.error:
+            # The log is truncated before the first complete entry header.
+            return
         if h.sequence() == expected_seqnum.value and h.validate_log_entry():
             yield h
 
