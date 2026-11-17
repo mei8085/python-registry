@@ -1,3 +1,15 @@
+unreleased
+  - confine transaction log replay to the hive extent declared by each log entry:
+    dirty pages whose range exceeds hbins_size, whose declared length does not
+    match the data carried by the log, or whose growth is not backed by pages
+    are refused as a unit, so a crafted or damaged log can no longer overwrite
+    bytes of the primary hive it does not own
+  - update the REGF header only for entries that were actually applied, so a
+    refused replay leaves the hive untouched and still marked as requiring
+    recovery (including the case where the header itself needs recovery)
+  - stop log entry enumeration cleanly at a truncated or malformed entry instead
+    of letting a partial record abort the replay
+
 1.2.0
   - [DEPRECATED] records() in HBINBlock, use the more correct cells() instead, by @NiKiZe
   - fix bug in parsing of resident values with length zero, reported and patched by @BridgeyTheGeek

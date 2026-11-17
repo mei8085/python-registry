@@ -529,19 +529,31 @@ class REGFBlock(RegistryBlock):
     def log_entries(self):
         """
         A generator that enumerates all valid HvLE (HvLEBlock) structures in the transaction log file.
+
+        Enumeration stops at the first entry that is missing, malformed, or
+        carries an unexpected sequence number. A log that was cut short (for
+        example by a partial write) is therefore replayed up to its last
+        provable entry instead of raising or trusting the damaged tail.
         """
         expected_seqnum = c_uint32(self.hive_sequence2())
-        h = HvLEBlock(self._buf, self.first_log_entry_offset(), self)
-        if h.sequence() == expected_seqnum.value and h.validate_log_entry():
-            yield h
+        try:
+            h = HvLEBlock(self._buf, self.first_log_entry_offset(), self)
+            if h.sequence() != expected_seqnum.value or not h.validate_log_entry():
+                return
+        except (ParseException, struct.error):
+            return
 
-            while h.has_next():
+        yield h
+
+        while True:
+            try:
                 h = h.next()
                 expected_seqnum.value += 1
-                if h.sequence() == expected_seqnum.value and h.validate_log_entry():
-                    yield h
-                else:
-                    break
+                if h.sequence() != expected_seqnum.value or not h.validate_log_entry():
+                    return
+            except (ParseException, struct.error):
+                return
+            yield h
 
 
 class HBINCell(RegistryBlock):
@@ -1841,6 +1853,13 @@ class HvLEBlock(RegistryBlock):
     def validate_log_entry(self):
         """
         Check if this log entry is valid.
+
+        Besides the size, alignment, and hash checks, this verifies that the
+        dirty page references are self-consistent: their payloads must fit in
+        the entry, and every referenced range must stay inside the hive extent
+        declared by the entry. A crafted entry that claims a dirty page beyond
+        the hive boundary is therefore never considered valid, so it can never
+        be handed to the replay code.
         """
         if (self.size() <= LOG_ENTRY_SIZE_HEADER) or (self.size() % LOG_ENTRY_SIZE_ALIGNMENT != 0):
             return False
@@ -1848,10 +1867,60 @@ class HvLEBlock(RegistryBlock):
         if self.hbins_size() % 0x1000 != 0:
             return False
 
+        if not self.dirty_pages_fit_entry() or not self.dirty_pages_within_hive():
+            return False
+
         if self.hash_2() != self.calculate_hash_2() or self.hash_1() != self.calculate_hash_1():
             return False
 
         return True
+
+    def dirty_pages_fit_entry(self):
+        """
+        Check that the dirty page references and their payloads fit in this entry.
+
+        Each dirty page reference consumes 8 bytes in the entry header and the
+        data it refers to is carried inline. If the sum of the declared page
+        sizes plus the reference table exceeds the declared entry size, the
+        entry is malformed (for example a page whose declared length does not
+        match the data actually carried).
+        """
+        try:
+            entry_size = self.size()
+            end = LOG_ENTRY_SIZE_HEADER + 8 * self.dirty_pages_count()
+            if end > entry_size:
+                return False
+
+            for dirty_page_reference in self.dirty_pages_references():
+                size = dirty_page_reference.size()
+                if size <= 0:
+                    return False
+                end += size
+                if end > entry_size:
+                    return False
+
+            return True
+        except struct.error:
+            return False
+
+    def dirty_pages_within_hive(self):
+        """
+        Check that every dirty page range stays inside the hive extent that
+        this entry declares via hbins_size().
+
+        Dirty page offsets are relative to the first HBIN. A range that starts
+        or ends past the declared HBIN area would overwrite data that is not
+        part of the logged unit (slack space or the file tail), so such a
+        reference makes the whole entry invalid.
+        """
+        try:
+            limit = self.hbins_size()
+            for dirty_page_reference in self.dirty_pages_references():
+                if dirty_page_reference.offset() + dirty_page_reference.size() > limit:
+                    return False
+            return True
+        except struct.error:
+            return False
 
     def hive_flags(self):
         """
