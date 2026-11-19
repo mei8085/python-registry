@@ -67,6 +67,68 @@ Advanced users who wish to study the structure of the Windows
 Registry may find the `Registry.RegistryParse` module useful.
 This module implements all known structures of the Windows Registry.
 
+
+Security descriptors
+--------------------
+
+Each registry key references an `sk` (security key) record holding a
+Windows self-relative security descriptor. The `Registry.SecurityParse`
+module parses these descriptors in a forensics oriented, strictly bounded
+way: every component offset and length is validated against the bounds of
+the containing cell, so parsing can never read past the cell, and any
+structural problem raises `Registry.RegistryParse.ParseException`.
+
+The high level API exposes the parsed descriptor of a key directly:
+
+
+    from Registry import Registry
+
+    reg = Registry.Registry("SYSTEM")
+    sd = reg.root().security_descriptor()
+
+    print(sd.owner())            # SID, e.g. S-1-5-32-544 (Administrators)
+    print(sd.group())            # SID
+    print(sd.control_flag_names())
+
+    if not sd.dacl_present():
+        print("no DACL (legal)")
+    elif sd.dacl_null():
+        print("NULL DACL (legal: everyone is granted access)")
+    else:
+        for ace in sd.dacl():
+            if not ace.parsable:
+                # unknown ACE type: the raw bytes are preserved
+                print(ace.ace_type_name(), ace.raw_bytes())
+                continue
+            print(ace.category().value,      # explicit-allow / explicit-deny /
+                                             # inherited / system
+                  ace.ace_type_name(),
+                  ace.sid(),                 # trustee principal SID
+                  hex(ace.mask()),           # access rights mask
+                  ace.mask_names(),
+                  ace.ace_flag_names())      # inheritance flags
+
+
+The four forensic categories are available explicitly through
+`sd.explicit_allow_aces()`, `sd.explicit_deny_aces()`,
+`sd.inherited_aces()` and `sd.raw_aces()`. ACEs whose type is not
+understood are returned as `RawACE` objects with their original bytes
+intact rather than aborting the parse. The three legal "no effective
+DACL" states are kept distinct from corruption:
+
+  - no DACL at all (`SE_DACL_PRESENT` clear): `dacl_present()` is
+    `False`, `dacl()` is `None`;
+  - a NULL DACL (flag set, offset zero): `dacl_null()` is `True`;
+  - an empty but present DACL: `dacl()` returns an ACL with zero ACEs.
+
+At the low level, `RegistryParse.SKRecord.raw_security_descriptor()`
+returns the cell-bounded raw bytes and
+`RegistryParse.SKRecord.security_descriptor()` returns the parsed
+object. Key and value reading never depend on the security descriptor,
+so a corrupt descriptor does not affect normal hive traversal. See
+`samples/security_descriptors.py` for a complete reporting tool.
+
+
 Wanted
 ------
   - Bug reports.

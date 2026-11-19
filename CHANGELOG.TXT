@@ -1,3 +1,19 @@
+Unreleased
+  - add Registry.SecurityParse: full parsing of self-relative security
+    descriptors stored in SK records (owner/group SID, DACL/SACL and each
+    ACE's type, trustee, access mask and inheritance flags), with forensic
+    classification into explicit allow, explicit deny, inherited, system
+    and unparseable (raw) entries
+  - add SKRecord.raw_security_descriptor(), SKRecord.security_descriptor(),
+    NKRecord.has_security_descriptor()/security_descriptor() and
+    RegistryKey.security_descriptor(); parsing is strictly bounded by the
+    containing cell and raises ParseException on truncation, out of bounds
+    offsets or abnormal lengths, while legal no-DACL/NULL-DACL states remain
+    distinguishable from corruption
+  - add samples/security_descriptors.py reporting tool and tests covering
+    crafted descriptors, boundary violations and all SK records in the
+    sample SYSTEM hive
+
 1.2.0
   - [DEPRECATED] records() in HBINBlock, use the more correct cells() instead, by @NiKiZe
   - fix bug in parsing of resident values with length zero, reported and patched by @BridgeyTheGeek

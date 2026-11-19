@@ -375,6 +375,19 @@ class RegistryKey(object):
     	"""
     	return self._nkrecord.subkey_number()
 
+    def security_descriptor(self):
+        """
+        Return the parsed security descriptor of this key as a
+        Registry.SecurityParse.SecurityDescriptor.
+
+        Raises RegistryParse.RegistryStructureDoesNotExist if the key does
+        not reference an SK record, and RegistryParse.ParseException if the
+        referenced descriptor is structurally invalid. Ordinary key and
+        value reading never invokes this method, so a corrupt descriptor
+        does not affect traversal.
+        """
+        return self._nkrecord.security_descriptor()
+
 
 class Registry(object):
     """

@@ -1226,6 +1226,9 @@ class SKRecord(Record):
 
     May be referenced by multiple NK records.
     """
+    # Offset of the self relative security descriptor within the SK record.
+    SECURITY_DESCRIPTOR_OFFSET = 0x14
+
     def __init__(self, buf, offset, parent):
         """
         Constructor.
@@ -1242,9 +1245,86 @@ class SKRecord(Record):
 
         self._offset_prev_sk = self.unpack_dword(0x4)
         self._offset_next_sk = self.unpack_dword(0x8)
+        self._security_descriptor = None
 
     def __str__(self):
         return "SK Record at 0x%x" % (self.offset())
+
+    def prev_sk_offset(self):
+        """
+        Get the relative offset of the previous SK record, or 0xFFFFFFFF if
+        this is the first SK record.
+        """
+        return self._offset_prev_sk
+
+    def next_sk_offset(self):
+        """
+        Get the relative offset of the next SK record, or 0xFFFFFFFF if this
+        is the last SK record.
+        """
+        return self._offset_next_sk
+
+    def _cell(self):
+        """
+        Get the HBINCell that contains this SK record. The security
+        descriptor is bounded by this cell's size, so parsing it can never
+        read past the cell into adjacent registry data.
+        """
+        if not isinstance(self._parent, HBINCell):
+            raise ParseException(
+                "SK Record at 0x%x is not contained in an HBINCell; cannot "
+                "compute security descriptor bounds" % self.offset())
+        return self._parent
+
+    def raw_security_descriptor(self):
+        """
+        Get the raw, unparsed self relative security descriptor bytes stored
+        in this SK record.
+
+        The returned buffer is exactly the portion of the containing cell's
+        data area that follows the 0x14 byte SK record header. The cell size
+        includes the 4 byte cell size prefix, so the record itself spans
+        cell.size() - 4 bytes. Abnormal cell sizes raise ParseException; no
+        read beyond the cell is attempted.
+        """
+        cell = self._cell()
+        record_length = cell.size() - 4
+        descriptor_length = record_length - self.SECURITY_DESCRIPTOR_OFFSET
+        if descriptor_length < 0:
+            raise ParseException(
+                "SK Record at 0x%x has abnormal cell size %d: not enough "
+                "room for a security descriptor" %
+                (self.offset(), cell.size()))
+
+        # The descriptor begins 0x14 bytes into the SK record and ends at
+        # the end of the containing cell's data area; both bounds are
+        # checked against the hive buffer before slicing.
+        start = self._offset + self.SECURITY_DESCRIPTOR_OFFSET
+        end = self._offset + record_length
+        if start < 0 or end > len(self._buf) or end < start:
+            raise ParseException(
+                "SK Record at 0x%x security descriptor bounds "
+                "[0x%x, 0x%x) exceed the hive buffer" %
+                (self.offset(), start, end))
+        return self._buf[start:end]
+
+    def security_descriptor(self):
+        """
+        Parse and return the security descriptor as a
+        Registry.SecurityParse.SecurityDescriptor.
+
+        The parse is strictly bounded by the containing cell. Truncated self
+        relative security descriptors, out of bounds component offsets and
+        abnormal lengths raise RegistryParse.ParseException. A legal
+        descriptor without a DACL parses successfully (use
+        SecurityDescriptor.dacl_present() / dacl_null() to distinguish the
+        legal no-DACL cases from corruption).
+        """
+        if self._security_descriptor is None:
+            from Registry import SecurityParse
+            self._security_descriptor = SecurityParse.SecurityDescriptor(
+                self.raw_security_descriptor())
+        return self._security_descriptor
 
 
 class ValuesList(HBINCell):
@@ -1595,6 +1675,31 @@ class NKRecord(Record):
 
         d = HBINCell(self._buf, offset, self)
         return SKRecord(self._buf, d.data_offset(), d)
+
+    def has_security_descriptor(self):
+        """
+        Does this NKRecord reference an SK record?
+        The security key offset of a root key is normally 0xFFFFFFFF.
+        """
+        return self.unpack_dword(0x2C) != 0xFFFFFFFF
+
+    def security_descriptor(self):
+        """
+        Get the parsed security descriptor (a
+        Registry.SecurityParse.SecurityDescriptor) associated with this
+        NKRecord.
+
+        Raises RegistryStructureDoesNotExist if this NKRecord does not
+        reference an SK record, and ParseException if the referenced
+        security descriptor is structurally invalid. Key and value reading
+        semantics do not depend on this method, so a corrupt security
+        descriptor never affects normal hive traversal.
+        """
+        if not self.has_security_descriptor():
+            raise RegistryStructureDoesNotExist(
+                "NK Record at 0x%x has no associated SK Record" %
+                self.offset())
+        return self.sk_record().security_descriptor()
 
     def values_number(self):
         """
